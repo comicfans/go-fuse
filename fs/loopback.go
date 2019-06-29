@@ -8,6 +8,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
 	"syscall"
 
 	"github.com/hanwen/go-fuse/fuse"
@@ -66,6 +67,32 @@ func (n *loopbackRoot) Getattr(ctx context.Context, f FileHandle, out *fuse.Attr
 	return OK
 }
 
+func ToMapped(name string) string {
+
+	extMap := map[string]string{
+		".zip": ".mapped.cbz",
+		".rar": ".mapped.cbr",
+	}
+
+	ext := filepath.Ext(name)
+
+	if mapped, ok := extMap[ext]; ok {
+
+		return name + mapped
+	}
+
+	return name
+}
+
+func FromMapped(name string) string {
+
+	if matched, _ := regexp.MatchString("\\.mapped.cb[r|z]$", name); matched {
+		name = name[:(len(name) - len(".mapped.cbr"))]
+	}
+
+	return name
+}
+
 func (n *loopbackNode) root() *loopbackRoot {
 	return n.Root().Operations().(*loopbackRoot)
 }
@@ -75,8 +102,27 @@ func (n *loopbackNode) path() string {
 	return filepath.Join(n.root().rootPath, path)
 }
 
+type dirEntryRenamer struct {
+	DirStream
+}
+
+func (e dirEntryRenamer) Next() (fuse.DirEntry, syscall.Errno) {
+
+	res, no := e.DirStream.Next()
+
+	if no != 0 {
+		return res, no
+	}
+
+	res.Name = ToMapped(res.Name)
+
+	return res, no
+
+}
+
 func (n *loopbackNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*Inode, syscall.Errno) {
-	p := filepath.Join(n.path(), name)
+
+	p := filepath.Join(n.path(), FromMapped(name))
 
 	st := syscall.Stat_t{}
 	err := syscall.Lstat(p, &st)
@@ -184,7 +230,7 @@ func (r *loopbackRoot) idFromStat(st *syscall.Stat_t) StableAttr {
 var _ = (NodeCreater)((*loopbackNode)(nil))
 
 func (n *loopbackNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (inode *Inode, fh FileHandle, fuseFlags uint32, errno syscall.Errno) {
-	p := filepath.Join(n.path(), name)
+	p := filepath.Join(n.path(), FromMapped(name))
 
 	fd, err := syscall.Open(p, int(flags)|os.O_CREATE, mode)
 	if err != nil {
@@ -260,7 +306,8 @@ func (n *loopbackNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 }
 
 func (n *loopbackNode) Open(ctx context.Context, flags uint32) (fh FileHandle, fuseFlags uint32, errno syscall.Errno) {
-	p := n.path()
+	p := FromMapped(n.path())
+
 	f, err := syscall.Open(p, int(flags), 0)
 	if err != nil {
 		return nil, 0, ToErrno(err)
@@ -279,14 +326,21 @@ func (n *loopbackNode) Opendir(ctx context.Context) syscall.Errno {
 }
 
 func (n *loopbackNode) Readdir(ctx context.Context) (DirStream, syscall.Errno) {
-	return NewLoopbackDirStream(n.path())
+
+	actual, err := NewLoopbackDirStream(n.path())
+
+	if err != 0 {
+		return actual, err
+	}
+
+	return dirEntryRenamer{actual}, err
 }
 
 func (n *loopbackNode) Getattr(ctx context.Context, f FileHandle, out *fuse.AttrOut) syscall.Errno {
 	if f != nil {
 		return f.(FileGetattrer).Getattr(ctx, out)
 	}
-	p := n.path()
+	p := FromMapped(n.path())
 
 	var err error = nil
 	st := syscall.Stat_t{}
